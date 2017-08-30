@@ -79,3 +79,9 @@ tags
 # HSR
 ##########################
 c/lib/hsr/build
+
+# JetBrains generated files
+###########################
+.idea
+
+
