@@ -67,6 +67,9 @@ from lib.packet.cert_mgmt import (
     CertChainRequest,
     TRCReply,
     TRCRequest,
+    CertIssueReply,
+    CertIssueRequest,
+    get_cert_issue_request,
 )
 from lib.packet.ext.one_hop_path import OneHopPathExt
 from lib.packet.host_addr import HostAddrNone
@@ -143,6 +146,8 @@ class SCIONElement(object):
     USE_TCP = False
     # Timeout for TRC or Certificate requests.
     TRC_CC_REQ_TIMEOUT = 3
+    # Timeout for Certificate issue requests.
+    CC_ISS_REQ_TIMEOUT = 3
 
     def __init__(self, server_id, conf_dir, public=None, bind=None, prom_export=None):
         """

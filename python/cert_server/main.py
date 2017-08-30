@@ -20,6 +20,7 @@
 import datetime
 import logging
 import os
+import signal
 import threading
 import time
 
@@ -56,6 +57,10 @@ from lib.packet.cert_mgmt import (
     CertChainRequest,
     TRCReply,
     TRCRequest,
+    CertIssueReply,
+    CertIssueRequest,
+    get_cert_issue_request,
+    get_signing_input_cert_issue_req,
 )
 from lib.packet.scion_addr import ISD_AS
 from lib.packet.svc import SVCType
@@ -76,6 +81,7 @@ from lib.zk.id import ZkID
 from lib.zk.zk import ZK_LOCK_SUCCESS, Zookeeper
 from sciond.sciond import SCIOND_API_SOCKDIR
 from scion_elem.scion_elem import SCIONElement
+from tools.cert_issuer import CertificateIssuer
 
 
 # Exported metrics.
@@ -93,6 +99,10 @@ DRKEY_MAX_TTL = datetime.timedelta(days=2).total_seconds()
 DRKEY_MAX_KEYS = 10**6
 # Timeout for first order DRKey requests
 DRKEY_REQUEST_TIMEOUT = 5
+# Timeout for Cert issue requests
+CISS_REQUEST_TIMEOUT = 5
+# Period before cert expires, when new version should be issued
+CERT_EXPIRING_PERIOD = 2*60
 
 
 class CertServer(SCIONElement):
@@ -116,6 +126,7 @@ class CertServer(SCIONElement):
         cc_labels = {**self._labels, "type": "cc"} if self._labels else None
         trc_labels = {**self._labels, "type": "trc"} if self._labels else None
         drkey_labels = {**self._labels, "type": "drkey"} if self._labels else None
+        ciss_labels = {**self._labels, "type": "ciss"} if self._labels else None
         self.cc_requests = RequestHandler.start(
             "CC Requests", self._check_cc, self._fetch_cc, self._reply_cc,
             labels=cc_labels,
@@ -128,6 +139,10 @@ class CertServer(SCIONElement):
             "DRKey Requests", self._check_drkey, self._fetch_drkey, self._reply_proto_drkey,
             labels=drkey_labels,
         )
+        self.ciss_requests = RequestHandler.start(
+            "CIss Requests", self._check_ciss, self._fetch_ciss, self._reply_ciss,
+            labels=ciss_labels,
+        )
 
         self.CTRL_PLD_CLASS_MAP = {
             PayloadClass.CERT: {
@@ -135,6 +150,8 @@ class CertServer(SCIONElement):
                 CertMgmtType.CERT_CHAIN_REPLY: self.process_cert_chain_reply,
                 CertMgmtType.TRC_REQ: self.process_trc_request,
                 CertMgmtType.TRC_REPLY: self.process_trc_reply,
+                CertMgmtType.CERT_ISSUE_REQ: self.process_cert_issue_request,
+                CertMgmtType.CERT_ISSUE_REPLY: self.process_cert_issue_reply,
             },
             PayloadClass.DRKEY: {
                 DRKeyMgmtType.FIRST_ORDER_REQUEST:
@@ -571,13 +588,169 @@ class CertServer(SCIONElement):
             REQS_TOTAL.labels(**self._labels, type=type_).inc(0)
         IS_MASTER.labels(**self._labels).set(0)
 
+
+    def process_cert_issue_request(self, req, meta):
+        """
+        Process a certificate issue request.
+
+        :param CertIssueRequest req: the Certificate issue request
+        :param UDPMetadata meta: the metadata
+        """
+        assert isinstance(req, CertIssueRequest)
+        logging.info("Cert issue request received from %s: %s", meta, req.short_desc())
+
+        try:
+            cert = self._verify_cert_issue_request(req, meta)
+        except SCIONVerificationError as e:
+            logging.warning("Invalid CertIssueRequest from %s. Reason %s: %s", meta, e,
+                            req.short_desc())
+            return
+
+        key = req, req.p.certVer
+        local = meta.ia == self.addr.isd_as
+        if not self._check_ciss(key):
+            if not local:
+                logging.warning(
+                    "Dropping CIss request from %s for %sv%s: "
+                    "CIss not found && requester is not local)",
+                    meta, *key)
+            else:
+                self.ciss_requests.put((key, (meta, req)))
+            return
+        self._reply_ciss(key, (meta, req))
+
+    def _verify_cert_issue_request(self, req, meta):
+        """
+        Verify that the Cert issue request is legit.
+        I.e. the signature is valid, the correct ISD AS is queried, timestamp is recent
+
+        :param CertIssueRequest req: the cert issue request
+        :param UDPMetadata meta: the metadata
+        :returns Certificate of the requester
+        :rtype: Certificate
+        :raises: SCIONVerificationError
+        """
+        if self.addr.isd_as != req.isd_as_core:
+            raise SCIONVerificationError("Request for other ISD-AS: %s" % req.isd_as_core)
+        if int(time.time()) - req.p.timestamp > CISS_REQUEST_TIMEOUT:
+            raise SCIONVerificationError("Expired request from %s. %ss old. Max %ss" % (
+                meta.ia, int(time.time()) - req.p.timestamp, CISS_REQUEST_TIMEOUT))
+        trc = self.trust_store.get_trc(meta.ia[0])
+        chain = self.trust_store.get_cert(meta.ia, req.p.certVer)
+        err = []
+        if not chain:
+            self._send_cc_request(meta.ia, req.p.certVer)
+            err.append("Certificate not present for %s(v: %s)" % (meta.ia, req.p.certVer))
+        if not trc:
+            self._send_trc_request(meta.ia[0], req.p.trcVer, meta.ia[1])
+            err.append("TRC not present for %s(v: %s)" % (meta.ia[0], req.p.trcVer))
+        if err:
+            raise SCIONVerificationError(", ".join(err))
+        raw = get_signing_input_cert_issue_req(req.isd_as.__str__(), req.p.timestamp)
+        try:
+            verify_sig_chain_trc(raw, req.p.signature, meta.ia, chain, trc)
+        except SCIONVerificationError as e:
+            raise SCIONVerificationError(str(e))
+        return chain.as_cert
+
+    def process_cert_issue_reply(self, rep, meta, from_zk=False):
+        """
+        Process Cert issue reply from core AS.
+
+        :param CertIssueReply rep: the received CertIssue reply
+        :param UDPMetadata meta: the metadata
+        :param Bool from_zk: if the reply has been received from Zookeeper
+        """
+        assert isinstance(rep, CertIssueReply)
+
+        ia_ver = rep.chain.get_leaf_isd_as_ver()
+
+        logging.info("Cert chain reply received for %sv%s (ZK: %s)" %
+                     (ia_ver[0], ia_ver[1], from_zk))
+
+        self.trust_store.add_cert(rep.chain)
+
+        if not from_zk:
+            self._share_object(rep.chain, is_trc=False)
+
+        # Reply to all requests for this certificate chain
+        self.ciss_requests.put((ia_ver, None))
+
+    def _check_ciss(self, key):
+        return True
+
+    def _fetch_ciss(self, key, req_info):
+        """
+        Fetch certificate issue.
+
+        :param key
+        """
+        cert = self.trust_store.get_cert(self.addr.isd_as)
+        trc = self.trust_store.get_trc(self.addr.isd_as[0])
+        isd_as_core = ISD_AS(cert.certs[0].issuer)
+        if not cert or not trc:
+            logging.warning("CertIssue request for %s not sent. Own CertChain/TRC not present.",
+                            isd_as_core)
+            return
+        req = get_cert_issue_request(isd_as_core, key.isd_as, self.signing_key, cert.certs[0].version, trc.version)
+        path_meta = self._get_path_via_api(isd_as_core)
+        if path_meta:
+            meta = self._build_meta(isd_as_core, host=SVCType.CS_A, path=path_meta.fwd_path())
+            self.send_meta(req, meta)
+            logging.info("CertIssueRequest (%s) sent to %s via %s", req.short_desc(), meta, path_meta)
+        else:
+            logging.warning("CertIssueRequest (for %s) not sent", req.short_desc())
+
+
+    def _reply_ciss(self, key, meta):
+        # Issue a new certificate
+        cert_req, ver = key
+        meta = meta[0]
+        isd_as = cert_req.isd_as
+        old_cert_chain = self.trust_store.get_cert(isd_as, ver)
+        core_cert_chain = self.trust_store.get_cert(cert_req.isd_as_core)
+        new_cert_chain = CertificateIssuer.reissue_cert_chain(old_cert_chain, core_cert_chain, self.signing_key)
+        self.send_meta(CertIssueReply.from_values(new_cert_chain, int(time.time())), meta)
+        logging.info("Cert issue for %sv%s sent to %s", isd_as, ver, meta)
+
+
+    def _check_cert_iss_req(self):
+        check_cyle = 60.0
+        while self.run_flag.is_set():
+            start = time.time()
+            cert_chain = self.trust_store.get_cert(self.addr.isd_as)
+            if cert_chain.as_cert.expiration_time - CERT_EXPIRING_PERIOD < start:
+                self._send_ciss_request(cert_chain)
+            sleep_interval(start, check_cyle, "CS._check_cert_iss_req cycle")
+
+    def _send_ciss_request(self, cert_chain):
+        trc = self.trust_store.get_trc(self.addr.isd_as[0])
+        req = get_cert_issue_request(cert_chain.as_cert.issuer, self.addr.isd_as, self.signing_key, cert_chain.as_cert.version, trc.version)
+        path_meta = self._get_path_via_api(ISD_AS(cert_chain.as_cert.issuer))
+        if path_meta:
+            meta = self._build_meta(ISD_AS(cert_chain.as_cert.issuer), host=SVCType.CS_A, path=path_meta.fwd_path())
+            self.send_meta(req, meta)
+            logging.info("CertIssueRequest (%s) sent to %s via %s", req.short_desc(), meta, path_meta)
+        else:
+            logging.warning("CertIssueRequest (for %s) not sent", req.short_desc())
+
+
+    def _sighup_handler(self, a, b):
+        print("HUP HANDLER")
+
+
     def run(self):
         """
         Run an instance of the Cert Server.
         """
+        # Register signal handler for testing certificate issuance
+        signal.signal(signal.SIGHUP, self._sighup_handler)
         threading.Thread(
             target=thread_safety_net, args=(self.worker,),
             name="CS.worker", daemon=True).start()
+        threading.Thread(
+            target=thread_safety_net, args=(self._check_cert_iss_req,),
+            name="CS._check_cert_iss_req", daemon=True).start()
         super().run()
 
 

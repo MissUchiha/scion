@@ -29,6 +29,7 @@ from external.expiring_dict import ExpiringDict
 from prometheus_client import Counter, Gauge
 
 # SCION
+import lib.app.sciond as lib_sciond
 from beacon_server.if_state import InterfaceState
 from lib.crypto.asymcrypto import get_sig_key
 from lib.crypto.hash_tree import ConnectedHashTree
@@ -62,6 +63,8 @@ from lib.packet.pcb import (
     PathSegment,
     PCBMarking,
 )
+from lib.packet.cert_mgmt import CertChainRequest
+
 from lib.packet.scion_addr import ISD_AS
 from lib.packet.svc import SVCType
 from lib.packet.scmp.types import SCMPClass, SCMPPathClass
@@ -81,7 +84,9 @@ from lib.zk.cache import ZkSharedCache
 from lib.zk.errors import ZkNoConnection
 from lib.zk.id import ZkID
 from lib.zk.zk import ZK_LOCK_SUCCESS, Zookeeper
+from sciond.sciond import SCIOND_API_SOCKDIR
 from scion_elem.scion_elem import SCIONElement
+from cert_server.main import CERT_EXPIRING_PERIOD
 
 
 # Exported metrics.
@@ -170,6 +175,8 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
         self.local_rev_cache = ExpiringDict(1000, HASHTREE_EPOCH_TIME +
                                             HASHTREE_EPOCH_TOLERANCE)
         self._rev_seg_lock = RLock()
+
+        lib_sciond.init(os.path.join(SCIOND_API_SOCKDIR, "sd%s.sock" % self.addr.isd_as))
 
     def _init_hash_tree(self):
         ifs = list(self.ifid2br.keys())
@@ -440,6 +447,11 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
         threading.Thread(
             target=thread_safety_net, args=(self._check_trc_cert_reqs,),
             name="Elem.check_trc_cert_reqs", daemon=True).start()
+        threading.Thread(
+            target=thread_safety_net, args=(self._issue_new_cert_version,),
+            name="BS._issue_new_cert_version", daemon=True).start()
+
+
         super().run()
 
     def _create_next_tree(self):
@@ -550,7 +562,27 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
         return self.trust_store.get_trc(self.addr.isd_as[0])
 
     def _get_my_cert(self):
-        return self.trust_store.get_cert(self.addr.isd_as)
+        cert = self.trust_store.get_cert(self.addr.isd_as)
+        return cert
+
+    def _issue_new_cert_version(self):
+        check_cyle = 60.0
+        while self.run_flag.is_set():
+            start = time.time()
+            cert = self.trust_store.get_cert(self.addr.isd_as)
+            # Request a new version of cert if there are 2 minutes until expiring
+            if time.time() > cert.as_cert.expiration_time - CERT_EXPIRING_PERIOD:
+                req = CertChainRequest.from_values(self.addr.isd_as, cert.as_cert.version + 1, cache_only=True)
+                path_meta = lib_sciond.get_paths(self.addr.isd_as)[0].path()
+                if path_meta:
+                    meta = self._build_meta(self.addr.isd_as, host=SVCType.CS_A, path=path_meta.fwd_path())
+                    self.send_meta(req, meta)
+                    logging.info("Cert chain request sent to %s via [%s]: %s",
+                                 meta, path_meta.short_desc(), req.short_desc())
+                else:
+                    logging.warning("Cert chain request (for %s) not sent: "
+                                    "no path found", req.short_desc())
+            sleep_interval(start, check_cyle, "BS._issue_new_cert_version cycle")
 
     @abstractmethod
     def _handle_verified_beacon(self, pcb):

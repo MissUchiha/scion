@@ -113,6 +113,8 @@ class CertMgmtType(object):
     CERT_CHAIN_REPLY = "certChainRep"
     TRC_REQ = "trcReq"
     TRC_REPLY = "trcRep"
+    CERT_ISSUE_REQ = "certIssueReq"
+    CERT_ISSUE_REPLY = "certIssueRep"
 
 
 class PathMgmtType(object):

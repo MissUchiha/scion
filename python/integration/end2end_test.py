@@ -35,6 +35,8 @@ from integration.base_cli_srv import (
     TestServerBase,
 )
 
+from tools.cert_issuer import CertificateIssuer
+
 
 class E2EClient(TestClientBase):
     """

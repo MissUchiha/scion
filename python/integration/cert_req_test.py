@@ -24,7 +24,7 @@ import threading
 # SCION
 import lib.app.sciond as lib_sciond
 from lib.main import main_wrapper
-from lib.packet.cert_mgmt import CertChainRequest, TRCRequest
+from lib.packet.cert_mgmt import CertChainRequest, TRCRequest, CertIssueRequest
 from lib.packet.path import SCIONPath
 from lib.packet.scion import SCIONL4Packet, build_base_hdrs
 from lib.packet.scion_addr import SCIONAddr
